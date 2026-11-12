@@ -49,10 +49,10 @@ Sau bài chính, bạn có thể mở rộng agent để điều tra **GitHub, C
 Fork repo đề về tài khoản của bạn, đổi tên theo mẫu (chi tiết ở [SUBMISSION.md](SUBMISSION.md)), clone về máy rồi mở terminal tại thư mục đó:
 
 ```bash
-python3 --version
-export PROVIDER=openai
-export MODEL='<tên-model-có-tool-calling>'
-export OPENAI_API_KEY='<api-key>'
+    python3 --version
+    export PROVIDER=openai
+    export MODEL='<tên-model-có-tool-calling>'
+    export OPENAI_API_KEY='<api-key>'
 ```
 
 Chọn cấu hình khác nếu cần:
@@ -64,7 +64,23 @@ Chọn cấu hình khác nếu cần:
 | `anthropic` | `ANTHROPIC_API_KEY` | Tên model Claude hỗ trợ tool use. |
 | `openrouter` | `OPENROUTER_API_KEY` | Model ID đầy đủ trên OpenRouter, thường có dạng provider/model. |
 
-Ví dụ chuyển sang Gemini: `export PROVIDER=gemini`, đặt `GEMINI_API_KEY` và `MODEL` phù hợp. Chọn một provider; không cần cả bốn key. File `.env.example` chỉ là mẫu: chương trình **không tự đọc `.env`**. Có thể chạy `cp .env.example .env`, điền key rồi chạy `source .env` trong mỗi terminal mới. Trên Windows, dùng Git Bash để chạy đúng các lệnh này, hoặc thay `python3` bằng `python` và đặt biến bằng `$env:TEN_BIEN='gia_tri'` trong PowerShell. Không commit key hay trace chứa dữ liệu nhạy cảm.
+Ví dụ chuyển sang Gemini: `export PROVIDER=gemini`, đặt `GEMINI_API_KEY` và `MODEL` phù hợp. Chọn một provider; không cần cả bốn key. [run.py](./run.py) và [run_evals.py](./evals/run_evals.py) tự đọc `.env` ở thư mục gốc, ưu tiên giá trị trong file hơn biến môi trường cũ. Có thể sao chép `.env.example` thành `.env` rồi điền cấu hình. File hỗ trợ `NAME=value` hoặc `export NAME=value`, không thực thi shell. Trên Windows, thay `python3` bằng `python`; PowerShell dùng `$env:TEN_BIEN='gia_tri'`, CMD dùng `set TEN_BIEN=gia_tri`. Không commit key hay trace chứa dữ liệu nhạy cảm.
+
+Nếu đã đặt key bằng `set` trong một cửa sổ CMD, các tiến trình khác không tự nhận biến đó. Từ thư mục repo, chạy ngay trong CMD đang giữ key:
+
+```bat
+python save_lab_config.py --provider gemini --model gemini-3.5-flash
+```
+
+[save_lab_config.py](./save_lab_config.py) đọc `GEMINI_API_KEY` từ chính CMD đó và ghi `.env` đã được Git bỏ qua; không in key. Dùng đúng provider/model đã được tài khoản cấp quyền. Sau đó có thể chạy eval từ terminal khác:
+
+```bash
+python evals/run_evals.py --agent-version before --max-steps 8 --request-interval 5 --http-retries 3 --output eval_before.json
+python evals/run_evals.py --agent-version after --max-steps 8 --request-interval 5 --http-retries 3 --output eval_after.json
+python evals/compare_evals.py --output eval_comparison.md
+```
+
+Hai lượt dùng cùng cấu hình và snapshot. `--request-interval` giới hạn nhịp gọi cả agent và judge; `--http-retries` thử lại tối đa 3 lần với HTTP 429/5xx, tôn trọng thời gian chờ trong budget tối đa 60 giây mỗi lần. Quota bằng 0 hoặc yêu cầu chờ vượt budget sẽ dừng. Một case `unscored` khiến điểm tổng là `null`.
 
 Adapter dùng Chat Completions cho OpenAI, Gemini compatibility và OpenRouter; Anthropic dùng Messages API. Nó phục vụ **tool calling cơ bản**, không bao phủ mọi tính năng đặc thù model như extended thinking. Khi provider từ chối model hoặc hết quota, kiểm tra quyền truy cập, model ID và key. Xem tài liệu: [OpenAI](https://developers.openai.com/api/docs/guides/function-calling), [Gemini](https://ai.google.dev/gemini-api/docs/openai), [Anthropic](https://platform.claude.com/docs/en/agents-and-tools/tool-use/how-tool-use-works), [OpenRouter](https://openrouter.ai/docs/guides/features/tool-calling).
 

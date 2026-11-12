@@ -6,6 +6,7 @@ from agent import run_agent
 from providers import Provider
 from status_tools import StatusTools
 from bonus.tools import BonusTools
+from runtime_config import load_env
 
 
 def run(question, mode, provider_name, model, max_steps, fail=False, bonus=False):
@@ -15,6 +16,11 @@ def run(question, mode, provider_name, model, max_steps, fail=False, bonus=False
 
 
 def main():
+    try:
+        load_env()
+    except ValueError as exc:
+        print(f'Lỗi: {exc}', file=sys.stderr)
+        return 1
     p = argparse.ArgumentParser(description='Chạy status agent')
     p.add_argument('question', help='Câu hỏi cho agent')
     p.add_argument('--bonus', action='store_true', help='Dùng bộ tools bonus')
