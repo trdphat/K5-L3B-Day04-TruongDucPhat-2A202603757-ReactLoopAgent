@@ -15,6 +15,22 @@ from test_agent import ScriptedProvider, call, final
 
 
 class PaginationTests(unittest.TestCase):
+    def test_latest_incident_comparison_requires_details_for_each_provider(self):
+        tools = BonusTools(scenario='noisy')
+        first = call('vercel-status', 'get_vercel_status', {'component': 'Builds'})
+        second = call('npm-status', 'get_npm_status', {'component': 'package publishing'})
+        first['calls'] += second['calls']
+        first['message']['tool_calls'] += second['message']['tool_calls']
+        provider = ScriptedProvider([
+            first, final('Both incidents resolved; https://www.vercel-status.com https://status.npmjs.org'),
+        ])
+        result = run_agent('Compare the latest incident scope and impact for Vercel Builds '
+                           'and npm package publishing.', provider, tools, max_steps=2)
+        self.assertEqual(result['status'], 'max_steps')
+        pending = next(event['incidents'] for event in result['trace']
+                       if event['event'] == 'validation_pending_incidents')
+        self.assertEqual({item['provider'] for item in pending}, {'vercel', 'npm'})
+
     def test_timeline_reads_all_pages_and_preserves_original_question(self):
         tools = BonusTools()
         args = {'provider': 'vercel', 'incident_id': 'sps6n39gm4sg', 'limit': 3}
@@ -95,6 +111,42 @@ class ContextAndTrustTests(unittest.TestCase):
 
 
 class BoundedRetryTests(unittest.TestCase):
+    def test_premature_final_after_429_requires_bounded_retry(self):
+        tools = BonusTools(scenario='rate_limit_once')
+        provider = ScriptedProvider([
+            call('first', 'get_vercel_status', {}),
+            final('Vercel unverified due to rate limit.'),
+            call('retry', 'get_vercel_status', {}),
+            final('Vercel operational in snapshot. https://www.vercel-status.com'),
+        ])
+        result = run_agent('Check Vercel and retry rate limits.', provider, tools, max_steps=4)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(tools.calls[('get_vercel_status', 'vercel')], 2)
+        self.assertIn('429', result['answer'])
+        self.assertTrue(any(event['event'] == 'validation_pending_retry'
+                            for event in result['trace']))
+
+    def test_major_indicator_is_not_lost_when_description_is_partial(self):
+        provider = ScriptedProvider([
+            call('status', 'get_cloudflare_status', {}),
+            final('Cloudflare has a partial system outage. https://www.cloudflarestatus.com'),
+        ])
+        result = run_agent('Check Cloudflare status.', provider, BonusTools(), max_steps=2)
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('indicator=major', result['answer'])
+
+    def test_third_429_tells_model_not_to_request_fourth_call(self):
+        tools = BonusTools(scenario='rate_limit_always')
+        provider = ScriptedProvider([
+            *(call(str(index), 'get_vercel_status', {}) for index in range(3)),
+            final('Vercel unverified due to rate limiting.'),
+        ])
+        result = run_agent('Check Vercel.', provider, tools, max_steps=4)
+        self.assertEqual(result['status'], 'completed')
+        last_result = json.loads(provider.histories[3][-1]['content'])
+        self.assertFalse(last_result['agent_retry']['retry_allowed'])
+        self.assertEqual(last_result['agent_retry']['attempts'], 3)
+
     def make_tools(self, retry_after):
         success = BonusTools().execute('get_vercel_status', {})
         tools = SimpleNamespace(schemas=SCHEMAS, system_prompt=SYSTEM_PROMPT)

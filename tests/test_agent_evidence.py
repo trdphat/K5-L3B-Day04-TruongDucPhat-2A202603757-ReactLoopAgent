@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent import run_agent
+from agent import _Evidence, run_agent
 from status_tools import StatusTools
 from test_lab import FakeProvider, final, tool_call
 
@@ -143,6 +143,75 @@ class ProviderCitationTests(unittest.TestCase):
 
 
 class EvidenceQualityTests(unittest.TestCase):
+    def test_historical_incident_does_not_replace_current_status_lookup(self):
+        tools = StatusTools()
+        args = '{"provider":"github","incident_id":"t89g2q1800fr"}'
+        url = tools.get_incident_details('github', 't89g2q1800fr')['url']
+        provider = FakeProvider([
+            tool_call('incident', 'get_incident_details', args),
+            final('Resolved, so GitHub has no current outage. ' + url),
+            tool_call('status', 'get_status', '{"provider":"github","component":"Actions"}'),
+            final('GitHub Actions operational in the snapshot; this historical incident resolved. ' + url),
+        ])
+        result = run_agent('Is GitHub Actions currently in outage because of this incident?',
+                           provider, tools, max_steps=4)
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(any(event['event'] == 'validation_pending_status' for event in result['trace']))
+        self.assertEqual(len(provider.histories), 4)
+
+    def test_no_forced_status_lookup_for_poem_or_unsupported_provider(self):
+        for question in ('Viết thơ, đừng kiểm tra GitHub hiện tại.',
+                         'Is Slack currently in outage?'):
+            with self.subTest(question=question):
+                provider = FakeProvider([final('No status claims.')])
+                self.assertEqual(run_agent(question, provider, StatusTools())['status'], 'completed')
+                self.assertEqual(len(provider.histories), 1)
+
+    def test_still_running_after_timeout_is_an_unsupported_claim(self):
+        from evals.scenarios import ScenarioTools
+        batch = tool_call('github', 'get_status', '{"provider":"github","component":"Actions"}')
+        other = tool_call('cloudflare', 'get_status', '{"provider":"cloudflare","component":"Spectrum"}')
+        batch['calls'] += other['calls']
+        batch['message']['tool_calls'] += other['message']['tool_calls']
+        provider = FakeProvider([
+            batch,
+            final('GitHub hoạt động bình thường. Cloudflare không thể truy cập được, '
+                  'nhưng có thể kết luận rằng nó vẫn đang hoạt động. https://www.githubstatus.com'),
+            final('GitHub operational theo snapshot. Cloudflare chưa xác minh do timeout. '
+                  'https://www.githubstatus.com'),
+        ])
+        result = run_agent('Kiểm tra GitHub và Cloudflare.', provider,
+                           ScenarioTools('cloudflare_timeout'), max_steps=3)
+        self.assertEqual(result['status'], 'completed')
+        self.assertNotIn('vẫn đang hoạt động', result['answer'])
+        self.assertTrue(any(event['event'] == 'validation_factual_conflict' for event in result['trace']))
+
+    def test_out_of_year_incidents_are_not_matches_for_historical_request(self):
+        incident = details('github', 'summary')
+        incident['created_at'] = '2026-01-01T00:00:00Z'
+        provider = FakeProvider([
+            read_call('details', 'github', 'summary'),
+            final('Trong năm 2024, có một số sự cố:\n| Incident | 2026-01-01 | '
+                  + incident['url'] + ' |'),
+            final('Không đủ dữ liệu để xác nhận danh sách đầy đủ cho năm 2024. ' + incident['url']),
+        ])
+        result = run_agent('Tìm toàn bộ incident GitHub trong năm 2024.', provider,
+                           MemoryTools({('github', 'summary'): incident}), max_steps=3)
+        self.assertEqual(result['status'], 'completed')
+        self.assertNotIn('2026-01-01', result['answer'])
+        self.assertTrue(any(event['event'] == 'validation_factual_conflict' for event in result['trace']))
+
+    def test_snapshot_timestamp_is_preserved_in_final_presentation(self):
+        tools = StatusTools()
+        captured = tools.get_status('github')['captured_at']
+        provider = FakeProvider([
+            tool_call('status', 'get_status', '{"provider":"github"}'),
+            final('GitHub operational. https://www.githubstatus.com'),
+        ])
+        result = run_agent('Check GitHub now.', provider, tools, max_steps=2)
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn(captured, result['answer'])
+
     def test_counts_and_timestamps_are_visible_without_changing_tool_result(self):
         incident = details('github', 'summary')
         incident.update(updates_total=9, status='resolved',
@@ -204,8 +273,65 @@ class EvidenceQualityTests(unittest.TestCase):
         ])
         result = run_agent(question, provider, StatusTools(), max_steps=3)
         self.assertEqual(result['status'], 'completed')
-        self.assertIn('Cannot establish full coverage', result['answer'])
-        self.assertTrue(any(event['event'] == 'validation_factual_conflict'
+        self.assertIn('Cannot provide a complete incident list', result['answer'])
+        self.assertTrue(any(event['event'] == 'validation_historical_gap'
+                            for event in result['trace']))
+
+    def test_historical_gap_finishes_before_repeating_unrelated_tool_calls(self):
+        provider = FakeProvider([
+            tool_call('status', 'get_status', '{"provider":"github","component":"Actions"}'),
+            final('Trong năm 2025 có incident GitHub Actions; xem các sự cố 2026 như sau: '
+                  '| Incident | 2026-11-05 |'),
+        ])
+        result = run_agent('Tìm danh sách đầy đủ incident GitHub Actions năm 2025.',
+                           provider, StatusTools(), max_steps=8)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(provider.histories), 2)
+        self.assertIn('Không thể cung cấp danh sách đầy đủ', result['answer'])
+        self.assertIn('https://www.githubstatus.com', result['answer'])
+
+    def test_unrelated_recent_incidents_do_not_force_wrong_year_citations(self):
+        tools = StatusTools()
+        provider = FakeProvider([
+            read_call('details', 'github', 't89g2q1800fr'),
+            final('Không đủ dữ liệu trong cửa sổ gần đây để lập danh sách đầy đủ năm 2025.'),
+        ])
+        result = run_agent('Liệt kê đầy đủ incident GitHub năm 2025.',
+                           provider, tools, max_steps=2)
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(any(event['event'] == 'validation_missing_source'
+                             for event in result['trace']))
+
+    def test_historical_uncertainty_with_markdown_heading_is_not_a_false_claim(self):
+        tools = StatusTools()
+        evidence = _Evidence('Tôi cần danh sách đầy đủ tất cả incident GitHub Actions trong năm 2025.')
+        evidence.observe('get_status', {'provider': 'github', 'component': 'Actions'},
+                         tools.get_status('github', 'Actions'))
+        draft = ('Không có bằng chứng nào về các sự cố GitHub Actions trong năm 2025 được thu thập. '
+                 'Dữ liệu hiện có chỉ cho thấy các sự cố xảy ra trong năm 2026.\n\n'
+                 '**Độ đầy đủ kết quả**: Chỉ có 50 sự cố gần nhất; không thể xác định '
+                 'khả năng bao phủ đầy đủ cho năm 2025.')
+        self.assertEqual(evidence.factual_issues(draft), [])
+        cautious = ('Tôi không thể cung cấp danh sách đầy đủ các sự cố trong năm 2025 do dữ liệu '
+                    'hiện tại không cho phép xác định liệu có sự cố nào xảy ra trong năm đó hay không. '
+                    'Trong 50 sự cố gần nhất không có sự cố năm 2025 được tìm thấy. '
+                    'Điều này không chứng minh rằng cả năm không có sự cố.')
+        self.assertEqual(evidence.factual_issues(cautious), [])
+
+    def test_repeated_unsupported_timeout_claim_uses_grounded_fallback(self):
+        batch = tool_call('github', 'get_status', '{"provider":"github"}')
+        other = tool_call('cloudflare', 'get_status', '{"provider":"cloudflare"}')
+        batch['calls'] += other['calls']
+        batch['message']['tool_calls'] += other['message']['tool_calls']
+        unsafe = final('Cloudflare vẫn đang hoạt động bình thường.')
+        provider = FakeProvider([batch, unsafe, unsafe, unsafe])
+        from evals.scenarios import ScenarioTools
+        result = run_agent('Kiểm tra GitHub và Cloudflare hiện tại.', provider,
+                           ScenarioTools('cloudflare_timeout'), max_steps=4)
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('chưa xác minh', result['answer'])
+        self.assertIn('github:', result['answer'])
+        self.assertTrue(any(event['event'] == 'validation_safe_fallback'
                             for event in result['trace']))
 
     def test_status_summary_does_not_authorize_invented_incident_urls(self):
